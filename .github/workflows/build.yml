@@ -1,0 +1,35 @@
+name: Compila VanessaAscolto per iPhone/iPad
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Scarica il codice
+        uses: actions/checkout@v4
+
+      - name: Compila l'app (senza firma, la firma la fa Sideloadly dopo)
+        run: |
+          xcodebuild -project VanessaAscolto.xcodeproj \
+            -scheme VanessaAscolto \
+            -sdk iphoneos \
+            -configuration Release \
+            CODE_SIGNING_ALLOWED=NO \
+            -derivedDataPath build \
+            clean build
+
+      - name: Impacchetta come .ipa
+        run: |
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/VanessaAscolto.app Payload/
+          zip -r VanessaAscolto.ipa Payload
+
+      - name: Carica il file pronto da scaricare
+        uses: actions/upload-artifact@v4
+        with:
+          name: VanessaAscolto-ipa
+          path: VanessaAscolto.ipa
