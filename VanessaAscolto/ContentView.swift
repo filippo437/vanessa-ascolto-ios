@@ -1,33 +1,68 @@
 import SwiftUI
 import AVFoundation
+import UIKit
 
-// Registra clip audio da ~2 secondi, una dopo l'altra, e le manda al server di Vanessa
-// (lo stesso vanessa_ascolto.py gia' usato dalla pagina web e dall'app Android).
-// La modalita' "Background Modes: Audio" (da abilitare in Xcode, vedi istruzioni)
-// permette di continuare a registrare anche a schermo bloccato.
+// Cattura audio in modo CONTINUO (non piu' a pezzi da 2 secondi) e lo manda in streaming
+// vero al server tramite WebSocket - questo e' cio' che elimina i "tick" che si sentivano
+// prima: niente piu' file separati da aprire/chiudere, un flusso unico ininterrotto.
+// Il motore audio resta sempre acceso mentre l'app e' "armata" (anche se non si sta
+// mandando nulla), cosi' iOS considera l'app davvero attiva in background e non la
+// sospende piu' per inattivita' come succedeva prima.
 class Trasmettitore: NSObject, ObservableObject {
-    @Published var inTrasmissione = false
+    @Published var inTrasmissione = false   // il telefono e' "armato": microfono acceso, pronto in background
+    @Published var inviaAttivo = false      // se l'invio vero e proprio e' acceso, deciso dal server
     @Published var messaggio = "Fermato"
 
-    private var recorder: AVAudioRecorder?
-    private var timer: Timer?
+    private let engine = AVAudioEngine()
+    private var convertitore: AVAudioConverter?
+    private let formatoDestinazione = AVAudioFormat(
+        commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true
+    )!
+
+    private var wsTask: URLSessionWebSocketTask?
+    private var wsSession: URLSession?
+    private var riconnettiTimer: Timer?
+    private var pollTimer: Timer?
     private var server = ""
     private var password = ""
     private let session = AVAudioSession.sharedInstance()
+    private var compitoBackground: UIBackgroundTaskIdentifier = .invalid
 
     override init() {
         super.init()
-        // Se arriva una telefonata (o Siri, o un'altra app audio), iOS toglie il microfono
-        // da sola; appena l'interruzione finisce lo riprendiamo qui, cosi' la trasmissione
-        // si riprende da sola invece di restare silenziosa.
         NotificationCenter.default.addObserver(
             self, selector: #selector(interruzioneAudio(_:)),
             name: AVAudioSession.interruptionNotification, object: session
+        )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(entrataInBackground),
+            name: UIApplication.didEnterBackgroundNotification, object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(ritornoInPrimoPiano),
+            name: UIApplication.willEnterForegroundNotification, object: nil
         )
     }
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+    }
+
+    @objc private func entrataInBackground() {
+        guard inTrasmissione else { return }
+        compitoBackground = UIApplication.shared.beginBackgroundTask(withName: "vanessa-ascolto") { [weak self] in
+            guard let self = self else { return }
+            UIApplication.shared.endBackgroundTask(self.compitoBackground)
+            self.compitoBackground = .invalid
+        }
+        try? session.setActive(true)
+    }
+
+    @objc private func ritornoInPrimoPiano() {
+        if compitoBackground != .invalid {
+            UIApplication.shared.endBackgroundTask(compitoBackground)
+            compitoBackground = .invalid
+        }
     }
 
     @objc private func interruzioneAudio(_ notifica: Notification) {
@@ -36,6 +71,7 @@ class Trasmettitore: NSObject, ObservableObject {
               let tipo = AVAudioSession.InterruptionType(rawValue: grezzo) else { return }
         if tipo == .ended {
             try? session.setActive(true)
+            try? engine.start()
         }
     }
 
@@ -63,10 +99,11 @@ class Trasmettitore: NSObject, ObservableObject {
                 guard let self = self else { return }
                 if concesso {
                     self.inTrasmissione = true
-                    self.messaggio = "In trasmissione (anche a schermo bloccato)"
-                    self.registraSegmento()
+                    self.messaggio = "Pronta - in attesa di un comando"
+                    self.avviaMotoreAudio()
+                    self.controllaAudioRichiesto()
                 } else {
-                    self.messaggio = "Permesso al microfono negato. Vai in Impostazioni > Vanessa Ascolto e concedilo."
+                    self.messaggio = "Permesso al microfono negato. Vai in Impostazioni > Vanessa e concedilo."
                 }
             }
         }
@@ -74,82 +111,161 @@ class Trasmettitore: NSObject, ObservableObject {
 
     func ferma() {
         inTrasmissione = false
-        timer?.invalidate()
-        timer = nil
-        recorder?.stop()
-        recorder = nil
+        inviaAttivo = false
+        pollTimer?.invalidate(); pollTimer = nil
+        riconnettiTimer?.invalidate(); riconnettiTimer = nil
+        fermaMotoreAudio()
+        chiudiWebSocket()
         try? session.setActive(false, options: .notifyOthersOnDeactivation)
+        if compitoBackground != .invalid {
+            UIApplication.shared.endBackgroundTask(compitoBackground)
+            compitoBackground = .invalid
+        }
         messaggio = "Fermato"
     }
 
-    private func registraSegmento() {
-        guard inTrasmissione else { return }
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("segmento_\(Int(Date().timeIntervalSince1970 * 1000)).m4a")
-        let impostazioni: [String: Any] = [
-            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
-            AVSampleRateKey: 44100,
-            AVNumberOfChannelsKey: 1,
-            AVEncoderAudioQualityKey: AVAudioQuality.medium.rawValue,
-            AVEncoderBitRateKey: 32000
-        ]
+    // ---------------- Motore audio: cattura continua, sempre attiva mentre armata ----------------
+
+    private func avviaMotoreAudio() {
+        let inputNode = engine.inputNode
+        let formatoInput = inputNode.outputFormat(forBus: 0)
+        convertitore = AVAudioConverter(from: formatoInput, to: formatoDestinazione)
+
+        inputNode.installTap(onBus: 0, bufferSize: 1600, format: formatoInput) { [weak self] buffer, _ in
+            guard let self = self, self.inviaAttivo else { return }
+            self.inviaBuffer(buffer, formatoInput: formatoInput)
+        }
+        engine.prepare()
         do {
-            let r = try AVAudioRecorder(url: url, settings: impostazioni)
-            recorder = r
-            r.record()
+            try engine.start()
         } catch {
-            // Non e' riuscita a partire: riprova tra un secondo invece di fermarsi del tutto.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-                self?.registraSegmento()
+            DispatchQueue.main.async { self.messaggio = "Errore microfono: \(error.localizedDescription)" }
+        }
+    }
+
+    private func fermaMotoreAudio() {
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        convertitore = nil
+    }
+
+    private func inviaBuffer(_ buffer: AVAudioPCMBuffer, formatoInput: AVAudioFormat) {
+        guard let convertitore = convertitore else { return }
+        let capacita = AVAudioFrameCount(formatoDestinazione.sampleRate * Double(buffer.frameLength) / formatoInput.sampleRate) + 16
+        guard let uscita = AVAudioPCMBuffer(pcmFormat: formatoDestinazione, frameCapacity: capacita) else { return }
+
+        var consumato = false
+        var erroreConversione: NSError?
+        convertitore.convert(to: uscita, error: &erroreConversione) { _, stato in
+            if consumato {
+                stato.pointee = .noDataNow
+                return nil
             }
-            return
+            consumato = true
+            stato.pointee = .haveData
+            return buffer
         }
-        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self] _ in
-            self?.chiudiEInvia(url: url)
-        }
+        guard erroreConversione == nil, let dati = uscita.int16ChannelData else { return }
+        let bytes = Data(bytes: dati[0], count: Int(uscita.frameLength) * 2)
+        inviaSuWebSocket(bytes)
     }
 
-    private func chiudiEInvia(url: URL) {
-        recorder?.stop()
-        recorder = nil
-        guard inTrasmissione else { return }
-        invia(url: url)
-        registraSegmento()
+    // ---------------- WebSocket: connessione persistente verso il server ----------------
+
+    private func apriWebSocketSeServe() {
+        guard wsTask == nil else { return }
+        let base = server
+            .replacingOccurrences(of: "https://", with: "wss://")
+            .replacingOccurrences(of: "http://", with: "ws://")
+        guard let encodedPw = password.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: base + "/ascolto/ws?ruolo=trasmetti&pw=" + encodedPw) else { return }
+
+        let s = URLSession(configuration: .default)
+        wsSession = s
+        let task = s.webSocketTask(with: url)
+        wsTask = task
+        ascoltaChiusura(task)
+        task.resume()
     }
 
-    private func invia(url: URL) {
-        guard let dati = try? Data(contentsOf: url) else { return }
-        try? FileManager.default.removeItem(at: url)
-        guard let endpoint = URL(string: server + "/ascolto/invia") else { return }
-        var richiesta = URLRequest(url: endpoint)
-        richiesta.httpMethod = "POST"
-        richiesta.setValue("audio/mp4", forHTTPHeaderField: "Content-Type")
-        richiesta.setValue(password, forHTTPHeaderField: "X-Ascolto-Password")
-        richiesta.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
-        richiesta.timeoutInterval = 8
-        URLSession.shared.uploadTask(with: richiesta, from: dati) { [weak self] _, risposta, errore in
-            if let http = risposta as? HTTPURLResponse, http.statusCode == 403 {
-                DispatchQueue.main.async {
-                    self?.messaggio = "Password sbagliata: fermato."
-                    self?.ferma()
+    private func ascoltaChiusura(_ task: URLSessionWebSocketTask) {
+        task.receive { [weak self] risultato in
+            guard let self = self else { return }
+            switch risultato {
+            case .failure:
+                if self.wsTask === task { self.wsTask = nil }
+                self.pianificaRiconnessione()
+            case .success:
+                if self.wsTask === task {
+                    self.ascoltaChiusura(task)
                 }
             }
-            // Un errore di rete per una singola clip non e' grave: la prossima puo' farcela.
+        }
+    }
+
+    private func pianificaRiconnessione() {
+        guard inviaAttivo, inTrasmissione else { return }
+        riconnettiTimer?.invalidate()
+        riconnettiTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self] _ in
+            self?.apriWebSocketSeServe()
+        }
+    }
+
+    private func chiudiWebSocket() {
+        wsTask?.cancel(with: .goingAway, reason: nil)
+        wsTask = nil
+        wsSession = nil
+    }
+
+    private func inviaSuWebSocket(_ dati: Data) {
+        guard inviaAttivo else { return }
+        if wsTask == nil { apriWebSocketSeServe() }
+        wsTask?.send(.data(dati)) { [weak self] errore in
+            if errore != nil {
+                self?.wsTask = nil
+                self?.pianificaRiconnessione()
+            }
+        }
+    }
+
+    // ---------------- Controllo acceso/spento, deciso dal server ----------------
+
+    private func controllaAudioRichiesto() {
+        guard inTrasmissione, let endpoint = URL(string: server + "/ascolto/audio_stato") else { return }
+        var richiesta = URLRequest(url: endpoint)
+        richiesta.setValue(password, forHTTPHeaderField: "X-Ascolto-Password")
+        richiesta.timeoutInterval = 6
+        URLSession.shared.dataTask(with: richiesta) { [weak self] dati, _, _ in
+            guard let self = self, let dati = dati,
+                  let risposta = try? JSONSerialization.jsonObject(with: dati) as? [String: Any],
+                  let acceso = risposta["on"] as? Bool else { return }
+            DispatchQueue.main.async {
+                guard self.inTrasmissione else { return }
+                let primaEraAttivo = self.inviaAttivo
+                self.inviaAttivo = acceso
+                self.messaggio = acceso ? "In trasmissione (anche a schermo bloccato)" : "Pronta - in attesa di un comando"
+                if acceso && !primaEraAttivo {
+                    self.apriWebSocketSeServe()
+                } else if !acceso && primaEraAttivo {
+                    self.chiudiWebSocket()
+                }
+            }
         }.resume()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self] _ in
+            self?.controllaAudioRichiesto()
+        }
     }
 }
 
 extension Color {
-    // Lo stesso fucsia del logo "VANESSA".
-    static let vanessaFucsia = Color(red: 0.86, green: 0.0, blue: 0.55)
+    static let vanessaFucsia = Color(red: 0.90, green: 0.0, blue: 0.49)
+    static let vanessaNero = Color(red: 0.04, green: 0.04, blue: 0.04)
 }
 
 struct ContentView: View {
     @AppStorage("vanessa_pin") private var pinSalvato = ""
     @State private var sbloccato = false
     @Environment(\.scenePhase) private var fase
-    // La trasmissione vive qui, non dentro la schermata sbloccata: cosi' se l'app torna in
-    // background e si rimette il blocco PIN, l'audio continua comunque ad essere inviato.
     @StateObject private var tx = Trasmettitore()
 
     var body: some View {
@@ -163,18 +279,16 @@ struct ContentView: View {
                         SbloccaView(pinSalvato: pinSalvato, sbloccato: $sbloccato)
                     }
                 }
-                .background(Color.white.ignoresSafeArea())
+                .background(Color.vanessaNero.ignoresSafeArea())
                 .transition(.opacity)
             }
         }
         .onChange(of: fase) { nuova in
-            // Ogni volta che l'app lascia il primo piano (Home, schermo bloccato, altra app),
-            // al ritorno richiede di nuovo il PIN - anche se la trasmissione continua lo stesso.
             if nuova != .active {
                 sbloccato = false
             }
         }
-        .background(Color.white.ignoresSafeArea())
+        .background(Color.vanessaNero.ignoresSafeArea())
     }
 }
 
@@ -191,7 +305,7 @@ struct ImpostaPinView: View {
             Spacer()
             Text("VANESSA")
                 .font(.system(size: 40, weight: .heavy))
-                .foregroundColor(.vanessaFucsia)
+                .foregroundColor(.white)
             Text("Crea un PIN per questa app")
                 .foregroundColor(.gray)
 
@@ -199,12 +313,14 @@ struct ImpostaPinView: View {
                 .keyboardType(.numberPad)
                 .multilineTextAlignment(.center)
                 .font(.title)
+                .foregroundColor(.white)
                 .frame(maxWidth: 200)
 
             SecureField("Ripeti il PIN", text: $conferma)
                 .keyboardType(.numberPad)
                 .multilineTextAlignment(.center)
                 .font(.title)
+                .foregroundColor(.white)
                 .frame(maxWidth: 200)
 
             if !errore.isEmpty {
@@ -238,12 +354,13 @@ struct SbloccaView: View {
             Spacer()
             Text("VANESSA")
                 .font(.system(size: 44, weight: .heavy))
-                .foregroundColor(.vanessaFucsia)
+                .foregroundColor(.white)
 
             SecureField("PIN", text: $pin)
                 .keyboardType(.numberPad)
                 .multilineTextAlignment(.center)
                 .font(.largeTitle)
+                .foregroundColor(.white)
                 .frame(maxWidth: 200)
                 .onChange(of: pin) { nuovo in
                     if nuovo.count >= pinSalvato.count {
@@ -276,33 +393,45 @@ struct TrasmissioneView: View {
             Spacer().frame(height: 20)
             Text("VANESSA")
                 .font(.system(size: 34, weight: .heavy))
-                .foregroundColor(.vanessaFucsia)
+                .foregroundColor(.white)
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Indirizzo del server").font(.caption).foregroundColor(.gray)
-                TextField("es. http://192.168.1.50:8001", text: $server)
-                    .textFieldStyle(.roundedBorder)
-                    .autocapitalization(.none)
-                    .disableAutocorrection(true)
-                    .keyboardType(.URL)
-            }
+            if !tx.inTrasmissione {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Indirizzo del server").font(.caption).foregroundColor(.gray)
+                    TextField("es. http://2.29.124.5:8080", text: $server)
+                        .textFieldStyle(.roundedBorder)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+                        .keyboardType(.URL)
+                }
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Password dell'ascolto").font(.caption).foregroundColor(.gray)
-                SecureField("Password", text: $password)
-                    .textFieldStyle(.roundedBorder)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Password dell'ascolto").font(.caption).foregroundColor(.gray)
+                    SecureField("Password", text: $password)
+                        .textFieldStyle(.roundedBorder)
+                }
             }
 
             if tx.inTrasmissione {
+                Spacer().frame(height: 40)
+                Text(tx.inviaAttivo ? "● Trasmissione attiva" : "Pronta, in attesa")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundColor(tx.inviaAttivo ? .green : .gray)
+                Spacer().frame(height: 10)
                 Button(action: { tx.ferma() }) {
-                    Text("Ferma").frame(maxWidth: .infinity)
+                    Text("BLOCK")
+                        .font(.system(size: 12, weight: .semibold))
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 8)
                 }
-                .buttonStyle(.bordered)
-                .tint(.vanessaFucsia)
-                .controlSize(.large)
+                .buttonStyle(.plain)
+                .foregroundColor(.vanessaFucsia)
+                .overlay(
+                    Capsule().stroke(Color.vanessaFucsia, lineWidth: 1.5)
+                )
             } else {
                 Button(action: { tx.avvia(server: server, password: password) }) {
-                    Text("Inizia a trasmettere").frame(maxWidth: .infinity)
+                    Text("Attiva questo telefono").frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.vanessaFucsia)
@@ -311,6 +440,7 @@ struct TrasmissioneView: View {
 
             Text(tx.messaggio)
                 .foregroundColor(.gray)
+                .font(.footnote)
                 .multilineTextAlignment(.center)
 
             Spacer()
