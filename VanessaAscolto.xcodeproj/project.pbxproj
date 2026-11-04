@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		A100000000000000000009 /* VanessaAscoltoApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000005 /* VanessaAscoltoApp.swift */; };
 		A10000000000000000000A /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000006 /* ContentView.swift */; };
+		A100000000000000000016 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A100000000000000000015 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -16,6 +17,7 @@
 		A100000000000000000006 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		A100000000000000000007 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A100000000000000000008 /* VanessaAscolto.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = VanessaAscolto.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A100000000000000000015 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -51,6 +53,7 @@
 				A100000000000000000005 /* VanessaAscoltoApp.swift */,
 				A100000000000000000006 /* ContentView.swift */,
 				A100000000000000000007 /* Info.plist */,
+				A100000000000000000015 /* Assets.xcassets */,
 			);
 			path = VanessaAscolto;
 			sourceTree = "<group>";
@@ -112,6 +115,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A100000000000000000016 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -171,6 +175,7 @@
 		A100000000000000000010 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -192,6 +197,7 @@
 		A100000000000000000011 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = NO;
