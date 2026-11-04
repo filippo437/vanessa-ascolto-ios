@@ -264,13 +264,24 @@ extension Color {
 
 struct ContentView: View {
     @AppStorage("vanessa_pin") private var pinSalvato = ""
+    @AppStorage("vanessa_server") private var server = ""
+    @AppStorage("vanessa_password") private var password = ""
     @State private var sbloccato = false
     @Environment(\.scenePhase) private var fase
     @StateObject private var tx = Trasmettitore()
 
+    private var configuratoCompleto: Bool {
+        !server.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !password.isEmpty
+    }
+
     var body: some View {
         ZStack {
-            TrasmissioneView(tx: tx)
+            Color.vanessaNero.ignoresSafeArea()
+
+            if configuratoCompleto {
+                TrasmissioneView(tx: tx, server: server, password: password)
+            }
+
             if !sbloccato {
                 Group {
                     if pinSalvato.isEmpty {
@@ -281,6 +292,9 @@ struct ContentView: View {
                 }
                 .background(Color.vanessaNero.ignoresSafeArea())
                 .transition(.opacity)
+            } else if !configuratoCompleto {
+                ConfiguraServerView(server: $server, password: $password)
+                    .background(Color.vanessaNero.ignoresSafeArea())
             }
         }
         .onChange(of: fase) { nuova in
@@ -288,7 +302,62 @@ struct ContentView: View {
                 sbloccato = false
             }
         }
-        .background(Color.vanessaNero.ignoresSafeArea())
+    }
+}
+
+// ------------------------------------------------------------- tastierino numerico condiviso (stile PIN)
+struct TastieraPin: View {
+    let azionePremuto: (String) -> Void
+
+    var body: some View {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 18) {
+            ForEach(1...9, id: \.self) { numero in
+                tastoNumero("\(numero)")
+            }
+            Color.clear.frame(height: 50)
+            tastoNumero("0")
+            tastoBackspace
+        }
+        .frame(maxWidth: 220)
+    }
+
+    private func tastoNumero(_ testo: String) -> some View {
+        Button(action: { azionePremuto(testo) }) {
+            Text(testo)
+                .font(.system(size: 26, weight: .regular))
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity, minHeight: 50)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var tastoBackspace: some View {
+        Button(action: { azionePremuto("backspace") }) {
+            Image(systemName: "delete.left")
+                .font(.system(size: 22))
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity, minHeight: 50)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// ------------------------------------------------------------- pallini che mostrano quante cifre del PIN sono state inserite
+struct PinPallini: View {
+    let lunghezzaAttuale: Int
+    let lunghezzaTotale: Int
+
+    var body: some View {
+        HStack(spacing: 14) {
+            ForEach(0..<lunghezzaTotale, id: \.self) { indice in
+                Circle()
+                    .strokeBorder(Color.vanessaFucsia, lineWidth: 2)
+                    .background(
+                        Circle().fill(indice < lunghezzaAttuale ? Color.vanessaFucsia : Color.clear)
+                    )
+                    .frame(width: 16, height: 16)
+            }
+        }
     }
 }
 
@@ -297,48 +366,61 @@ struct ImpostaPinView: View {
     @Binding var pinSalvato: String
     @Binding var sbloccato: Bool
     @State private var pin = ""
-    @State private var conferma = ""
+    @State private var primoPin = ""
+    @State private var fase = 1
     @State private var errore = ""
 
+    private let lunghezza = 4
+
     var body: some View {
-        VStack(spacing: 22) {
+        VStack(spacing: 10) {
             Spacer()
             Text("VANESSA")
-                .font(.system(size: 40, weight: .heavy))
+                .font(.system(size: 32, weight: .heavy))
                 .foregroundColor(.white)
-            Text("Crea un PIN per questa app")
+            Text(fase == 1 ? "Crea un PIN" : "Ripeti il PIN")
                 .foregroundColor(.gray)
+                .font(.footnote)
 
-            SecureField("Nuovo PIN", text: $pin)
-                .keyboardType(.numberPad)
-                .multilineTextAlignment(.center)
-                .font(.title)
-                .foregroundColor(.white)
-                .frame(maxWidth: 200)
-
-            SecureField("Ripeti il PIN", text: $conferma)
-                .keyboardType(.numberPad)
-                .multilineTextAlignment(.center)
-                .font(.title)
-                .foregroundColor(.white)
-                .frame(maxWidth: 200)
+            PinPallini(lunghezzaAttuale: pin.count, lunghezzaTotale: lunghezza)
+                .padding(.vertical, 24)
 
             if !errore.isEmpty {
                 Text(errore).foregroundColor(.red).font(.caption)
             }
 
-            Button("Conferma") {
-                guard pin.count >= 4 else { errore = "Almeno 4 cifre."; return }
-                guard pin == conferma else { errore = "I due PIN non coincidono."; return }
-                pinSalvato = pin
-                sbloccato = true
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.vanessaFucsia)
+            TastieraPin { tasto in gestisciTasto(tasto) }
 
             Spacer()
         }
         .padding(24)
+    }
+
+    private func gestisciTasto(_ tasto: String) {
+        errore = ""
+        if tasto == "backspace" {
+            if !pin.isEmpty { pin.removeLast() }
+            return
+        }
+        guard pin.count < lunghezza else { return }
+        pin += tasto
+        guard pin.count == lunghezza else { return }
+
+        if fase == 1 {
+            primoPin = pin
+            pin = ""
+            fase = 2
+        } else {
+            if pin == primoPin {
+                pinSalvato = pin
+                sbloccato = true
+            } else {
+                errore = "I PIN non coincidono, riprova."
+                pin = ""
+                fase = 1
+                primoPin = ""
+            }
+        }
     }
 }
 
@@ -350,74 +432,120 @@ struct SbloccaView: View {
     @State private var errore = false
 
     var body: some View {
-        VStack(spacing: 22) {
+        VStack(spacing: 10) {
             Spacer()
             Text("VANESSA")
-                .font(.system(size: 44, weight: .heavy))
+                .font(.system(size: 32, weight: .heavy))
                 .foregroundColor(.white)
+            Text("Inserisci il PIN")
+                .foregroundColor(.gray)
+                .font(.footnote)
 
-            SecureField("PIN", text: $pin)
-                .keyboardType(.numberPad)
-                .multilineTextAlignment(.center)
-                .font(.largeTitle)
-                .foregroundColor(.white)
-                .frame(maxWidth: 200)
-                .onChange(of: pin) { nuovo in
-                    if nuovo.count >= pinSalvato.count {
-                        if nuovo == pinSalvato {
-                            sbloccato = true
-                        } else {
-                            errore = true
-                            pin = ""
-                        }
-                    }
-                }
+            PinPallini(lunghezzaAttuale: pin.count, lunghezzaTotale: pinSalvato.count)
+                .padding(.vertical, 24)
 
             if errore {
                 Text("PIN sbagliato").foregroundColor(.red).font(.caption)
             }
+
+            TastieraPin { tasto in gestisciTasto(tasto) }
+
+            Spacer()
+        }
+        .padding(24)
+    }
+
+    private func gestisciTasto(_ tasto: String) {
+        if tasto == "backspace" {
+            if !pin.isEmpty { pin.removeLast() }
+            errore = false
+            return
+        }
+        guard pin.count < pinSalvato.count else { return }
+        pin += tasto
+        if pin.count == pinSalvato.count {
+            if pin == pinSalvato {
+                sbloccato = true
+            } else {
+                errore = true
+                pin = ""
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------- configurazione iniziale (una tantum): indirizzo server + password
+struct ConfiguraServerView: View {
+    @Binding var server: String
+    @Binding var password: String
+    @State private var serverTemp = ""
+    @State private var passwordTemp = ""
+
+    var body: some View {
+        VStack(spacing: 18) {
+            Spacer()
+            Text("VANESSA")
+                .font(.system(size: 32, weight: .heavy))
+                .foregroundColor(.white)
+            Text("Configurazione iniziale")
+                .foregroundColor(.gray)
+                .font(.footnote)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Indirizzo del server").font(.caption).foregroundColor(.gray)
+                TextField("es. http://2.29.124.5:8080", text: $serverTemp)
+                    .textFieldStyle(.roundedBorder)
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
+                    .keyboardType(.URL)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Password").font(.caption).foregroundColor(.gray)
+                SecureField("Password", text: $passwordTemp)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            Button("Salva") {
+                server = serverTemp.trimmingCharacters(in: .whitespacesAndNewlines)
+                password = passwordTemp
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.vanessaFucsia)
+            .disabled(serverTemp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || passwordTemp.isEmpty)
+
+            Text("Questa schermata appare solo una volta.")
+                .foregroundColor(.gray)
+                .font(.caption2)
+
             Spacer()
         }
         .padding(24)
     }
 }
 
-// ------------------------------------------------------------- schermata vera e propria, dopo lo sblocco
+// ------------------------------------------------------------- schermata vera e propria, dopo lo sblocco: niente campi in vista, solo stato
 struct TrasmissioneView: View {
     @ObservedObject var tx: Trasmettitore
-    @AppStorage("vanessa_server") private var server = ""
-    @AppStorage("vanessa_password") private var password = ""
+    let server: String
+    let password: String
 
     var body: some View {
-        VStack(spacing: 18) {
-            Spacer().frame(height: 20)
+        VStack(spacing: 14) {
+            Spacer().frame(height: 30)
             Text("VANESSA")
-                .font(.system(size: 34, weight: .heavy))
+                .font(.system(size: 13, weight: .semibold))
                 .foregroundColor(.white)
+                .opacity(0.8)
 
-            if !tx.inTrasmissione {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Indirizzo del server").font(.caption).foregroundColor(.gray)
-                    TextField("es. http://2.29.124.5:8080", text: $server)
-                        .textFieldStyle(.roundedBorder)
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
-                        .keyboardType(.URL)
-                }
+            sfera
+                .padding(.vertical, 10)
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Password dell'ascolto").font(.caption).foregroundColor(.gray)
-                    SecureField("Password", text: $password)
-                        .textFieldStyle(.roundedBorder)
-                }
-            }
+            Text(testoStato)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundColor(tx.inviaAttivo ? .green : .gray)
 
             if tx.inTrasmissione {
-                Spacer().frame(height: 40)
-                Text(tx.inviaAttivo ? "● Trasmissione attiva" : "Pronta, in attesa")
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundColor(tx.inviaAttivo ? .green : .gray)
-                Spacer().frame(height: 10)
                 Button(action: { tx.ferma() }) {
                     Text("BLOCK")
                         .font(.system(size: 12, weight: .semibold))
@@ -426,25 +554,50 @@ struct TrasmissioneView: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundColor(.vanessaFucsia)
-                .overlay(
-                    Capsule().stroke(Color.vanessaFucsia, lineWidth: 1.5)
-                )
+                .overlay(Capsule().stroke(Color.vanessaFucsia, lineWidth: 1.5))
+                .padding(.top, 20)
             } else {
                 Button(action: { tx.avvia(server: server, password: password) }) {
-                    Text("Attiva questo telefono").frame(maxWidth: .infinity)
+                    Text("Attiva questo telefono")
+                        .frame(maxWidth: 220)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.vanessaFucsia)
                 .controlSize(.large)
+                .padding(.top, 20)
             }
 
-            Text(tx.messaggio)
-                .foregroundColor(.gray)
-                .font(.footnote)
-                .multilineTextAlignment(.center)
+            if !tx.messaggio.isEmpty {
+                Text(tx.messaggio)
+                    .foregroundColor(.gray)
+                    .font(.footnote)
+                    .multilineTextAlignment(.center)
+                    .padding(.top, 8)
+            }
 
             Spacer()
         }
         .padding(24)
+    }
+
+    private var testoStato: String {
+        if tx.inviaAttivo { return "● Trasmissione attiva" }
+        if tx.inTrasmissione { return "Pronta, in attesa" }
+        return "Non attiva"
+    }
+
+    private var sfera: some View {
+        Circle()
+            .fill(
+                RadialGradient(
+                    colors: tx.inviaAttivo
+                        ? [Color(red: 1.0, green: 0.36, blue: 0.70), Color.vanessaFucsia]
+                        : [Color(white: 0.25), Color(white: 0.12)],
+                    center: UnitPoint(x: 0.35, y: 0.3),
+                    startRadius: 4, endRadius: 110
+                )
+            )
+            .frame(width: 160, height: 160)
+            .shadow(color: tx.inviaAttivo ? Color.vanessaFucsia.opacity(0.4) : .clear, radius: 40)
     }
 }
