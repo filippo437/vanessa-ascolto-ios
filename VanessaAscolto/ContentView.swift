@@ -12,6 +12,7 @@ class Trasmettitore: NSObject, ObservableObject {
     @Published var inTrasmissione = false   // il telefono e' "armato": microfono acceso, pronto in background
     @Published var inviaAttivo = false      // se l'invio vero e proprio e' acceso, deciso dal server
     @Published var messaggio = "Fermato"
+    @Published var erroreStreaming = ""   // dettaglio tecnico se il WebSocket non riesce a collegarsi, mostrato in chiaro
 
     private let engine = AVAudioEngine()
     private var convertitore: AVAudioConverter?
@@ -23,6 +24,7 @@ class Trasmettitore: NSObject, ObservableObject {
     private var wsSession: URLSession?
     private var riconnettiTimer: Timer?
     private var pollTimer: Timer?
+    private var timerStatoDispositivo: Timer?
     private var server = ""
     private var password = ""
     private let session = AVAudioSession.sharedInstance()
@@ -102,6 +104,7 @@ class Trasmettitore: NSObject, ObservableObject {
                     self.messaggio = "Pronta - in attesa di un comando"
                     self.avviaMotoreAudio()
                     self.controllaAudioRichiesto()
+                    self.avviaInvioStatoDispositivo()
                 } else {
                     self.messaggio = "Permesso al microfono negato. Vai in Impostazioni > Vanessa e concedilo."
                 }
@@ -114,6 +117,8 @@ class Trasmettitore: NSObject, ObservableObject {
         inviaAttivo = false
         pollTimer?.invalidate(); pollTimer = nil
         riconnettiTimer?.invalidate(); riconnettiTimer = nil
+        timerStatoDispositivo?.invalidate(); timerStatoDispositivo = nil
+        erroreStreaming = ""
         fermaMotoreAudio()
         chiudiWebSocket()
         try? session.setActive(false, options: .notifyOthersOnDeactivation)
@@ -178,7 +183,10 @@ class Trasmettitore: NSObject, ObservableObject {
             .replacingOccurrences(of: "https://", with: "wss://")
             .replacingOccurrences(of: "http://", with: "ws://")
         guard let encodedPw = password.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let url = URL(string: base + "/ascolto/ws?ruolo=trasmetti&pw=" + encodedPw) else { return }
+              let url = URL(string: base + "/ascolto/ws?ruolo=trasmetti&pw=" + encodedPw) else {
+            DispatchQueue.main.async { self.erroreStreaming = "Indirizzo del server non valido per lo streaming." }
+            return
+        }
 
         let s = URLSession(configuration: .default)
         wsSession = s
@@ -192,11 +200,15 @@ class Trasmettitore: NSObject, ObservableObject {
         task.receive { [weak self] risultato in
             guard let self = self else { return }
             switch risultato {
-            case .failure:
+            case .failure(let errore):
                 if self.wsTask === task { self.wsTask = nil }
+                DispatchQueue.main.async {
+                    self.erroreStreaming = "Streaming non connesso: \((errore as NSError).localizedDescription)"
+                }
                 self.pianificaRiconnessione()
             case .success:
                 if self.wsTask === task {
+                    DispatchQueue.main.async { self.erroreStreaming = "" }
                     self.ascoltaChiusura(task)
                 }
             }
@@ -226,6 +238,34 @@ class Trasmettitore: NSObject, ObservableObject {
                 self?.pianificaRiconnessione()
             }
         }
+    }
+
+    // ---------------- Stato del telefono (batteria) mandato periodicamente al server ----------------
+    // Il segnale cellulare non e' leggibile dalle app da qualche anno (Apple lo ha bloccato
+    // per privacy), quindi mandiamo solo la batteria: e' quella che la dashboard mostra.
+
+    private func avviaInvioStatoDispositivo() {
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        inviaStatoDispositivo()
+        timerStatoDispositivo = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
+            self?.inviaStatoDispositivo()
+        }
+    }
+
+    private func inviaStatoDispositivo() {
+        guard inTrasmissione, let endpoint = URL(string: server + "/ascolto/stato_dispositivo") else { return }
+        let livello = UIDevice.current.batteryLevel
+        let percentuale = livello >= 0 ? Int(livello * 100) : nil
+
+        var richiesta = URLRequest(url: endpoint)
+        richiesta.httpMethod = "POST"
+        richiesta.setValue(password, forHTTPHeaderField: "X-Ascolto-Password")
+        richiesta.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        richiesta.timeoutInterval = 6
+        var corpo: [String: Any] = [:]
+        if let percentuale = percentuale { corpo["batteria"] = percentuale }
+        richiesta.httpBody = try? JSONSerialization.data(withJSONObject: corpo)
+        URLSession.shared.dataTask(with: richiesta).resume()
     }
 
     // ---------------- Controllo acceso/spento, deciso dal server ----------------
@@ -573,6 +613,15 @@ struct TrasmissioneView: View {
                     .font(.footnote)
                     .multilineTextAlignment(.center)
                     .padding(.top, 8)
+            }
+
+            if !tx.erroreStreaming.isEmpty {
+                Text(tx.erroreStreaming)
+                    .foregroundColor(.red)
+                    .font(.caption2)
+                    .multilineTextAlignment(.center)
+                    .padding(.top, 4)
+                    .padding(.horizontal, 12)
             }
 
             Spacer()
