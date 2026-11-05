@@ -91,6 +91,11 @@ class Trasmettitore: NSObject, ObservableObject {
             UIApplication.shared.endBackgroundTask(compitoBackground)
             compitoBackground = .invalid
         }
+        // Controllo di sicurezza: se tornando in primo piano il motore non sta
+        // davvero girando (es. dopo una telefonata che ha lasciato tutto bloccato),
+        // lo ricostruiamo subito, senza aspettare il cane da guardia.
+        guard inTrasmissione, !engine.isRunning else { return }
+        riprovaRiattivazione(tentativiRimasti: 5)
     }
 
     @objc private func interruzioneAudio(_ notifica: Notification) {
@@ -101,8 +106,25 @@ class Trasmettitore: NSObject, ObservableObject {
             let opzioniGrezze = notifica.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt
             let dovrebberiprendere = opzioniGrezze.map { AVAudioSession.InterruptionOptions(rawValue: $0).contains(.shouldResume) } ?? true
             if dovrebberiprendere {
-                ricostruisciMotoreAudio()
+                // Appena finisce una telefonata (normale o VoIP come WhatsApp), l'hardware
+                // audio del telefono resta occupato per una frazione di secondo prima di
+                // liberarsi davvero: un singolo tentativo immediato spesso fallisce in
+                // silenzio. Qui riproviamo piu' volte con una piccola attesa crescente.
+                riprovaRiattivazione(tentativiRimasti: 5)
             }
+        }
+    }
+
+    // Riprova a riattivare sessione + motore audio con piccoli ritardi crescenti,
+    // finche' non funziona davvero (engine.isRunning) o finiscono i tentativi.
+    // Questo e' cio' che elimina il "si blocca e non riparte piu'" dopo una chiamata.
+    private func riprovaRiattivazione(tentativiRimasti: Int) {
+        guard inTrasmissione, !engine.isRunning, tentativiRimasti > 0 else { return }
+        ricostruisciMotoreAudio()
+        guard inTrasmissione, !engine.isRunning else { return }
+        let attesa = Double(6 - tentativiRimasti) * 0.6 + 0.4
+        DispatchQueue.main.asyncAfter(deadline: .now() + attesa) { [weak self] in
+            self?.riprovaRiattivazione(tentativiRimasti: tentativiRimasti - 1)
         }
     }
 
@@ -126,6 +148,9 @@ class Trasmettitore: NSObject, ObservableObject {
     private func ricostruisciMotoreAudio() {
         guard inTrasmissione else { return }
         fermaMotoreAudio()
+        // Dopo una telefonata iOS a volte "dimentica" la categoria della sessione:
+        // la impostiamo di nuovo esplicitamente prima di riattivare, non solo setActive.
+        try? session.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .allowBluetooth, .defaultToSpeaker])
         try? session.setActive(true)
         avviaMotoreAudio()
     }
