@@ -25,6 +25,8 @@ class Trasmettitore: NSObject, ObservableObject {
     private var riconnettiTimer: Timer?
     private var pollTimer: Timer?
     private var timerStatoDispositivo: Timer?
+    private var timerSorveglianza: Timer?
+    private var ultimoInvioRiuscito: Date?
     private var server = ""
     private var password = ""
     private let session = AVAudioSession.sharedInstance()
@@ -44,6 +46,30 @@ class Trasmettitore: NSObject, ObservableObject {
             self, selector: #selector(ritornoInPrimoPiano),
             name: UIApplication.willEnterForegroundNotification, object: nil
         )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(stoChiudendo),
+            name: UIApplication.willTerminateNotification, object: nil
+        )
+        // iOS puo' riconfigurare l'hardware audio in qualsiasi momento (anche senza
+        // una vera interruzione): se succede, il motore smette di dare buffer senza
+        // nessun errore visibile. Questi due osservatori ricostruiscono tutto quando capita.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(configurazioneAudioCambiata),
+            name: .AVAudioEngineConfigurationChange, object: engine
+        )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(percorsoAudioCambiato(_:)),
+            name: AVAudioSession.routeChangeNotification, object: session
+        )
+    }
+
+    // Tentativo "ultimo respiro": se iOS fa in tempo ad avvisarci prima di chiudere
+    // l'app (non sempre succede, specialmente se il sistema la termina in background
+    // per motivi suoi), mandiamo subito un ultimo aggiornamento al server. Non e'
+    // garantito, ma quando funziona rende la disconnessione visibile prima.
+    @objc private func stoChiudendo() {
+        guard inTrasmissione else { return }
+        inviaStatoDispositivo()
     }
 
     deinit {
@@ -72,9 +98,61 @@ class Trasmettitore: NSObject, ObservableObject {
               let grezzo = notifica.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
               let tipo = AVAudioSession.InterruptionType(rawValue: grezzo) else { return }
         if tipo == .ended {
-            try? session.setActive(true)
-            try? engine.start()
+            let opzioniGrezze = notifica.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt
+            let dovrebberiprendere = opzioniGrezze.map { AVAudioSession.InterruptionOptions(rawValue: $0).contains(.shouldResume) } ?? true
+            if dovrebberiprendere {
+                ricostruisciMotoreAudio()
+            }
         }
+    }
+
+    // Chiamati quando iOS cambia qualcosa nell'hardware audio sotto banco (es. riassegna
+    // il microfono, cambia dispositivo Bluetooth, o altro): senza questo, il motore resta
+    // "in esecuzione" ma smette di produrre buffer, in modo del tutto silenzioso.
+    @objc private func configurazioneAudioCambiata() {
+        guard inTrasmissione else { return }
+        DispatchQueue.main.async { [weak self] in self?.ricostruisciMotoreAudio() }
+    }
+
+    @objc private func percorsoAudioCambiato(_ notifica: Notification) {
+        guard inTrasmissione else { return }
+        DispatchQueue.main.async { [weak self] in self?.ricostruisciMotoreAudio() }
+    }
+
+    // Ricostruzione completa e sicura del motore audio: toglie il tap vecchio (che
+    // potrebbe avere un formato ormai non valido), riattiva la sessione e reinstalla
+    // tutto da zero. E' la base sia delle notifiche di sistema sopra, sia del cane da
+    // guardia qui sotto.
+    private func ricostruisciMotoreAudio() {
+        guard inTrasmissione else { return }
+        fermaMotoreAudio()
+        try? session.setActive(true)
+        avviaMotoreAudio()
+    }
+
+    // ---------------- Cane da guardia: si accorge da solo se l'invio si e' bloccato ----------------
+    // Copre qualunque causa di blocco silenzioso (anche una non ancora prevista sopra):
+    // se dovremmo star mandando audio ma da troppo tempo non ci riusciamo, ricostruisce
+    // tutto - motore audio e connessione - senza bisogno di intervento manuale.
+
+    private func avviaSorveglianza() {
+        timerSorveglianza?.invalidate()
+        timerSorveglianza = Timer.scheduledTimer(withTimeInterval: 20.0, repeats: true) { [weak self] _ in
+            self?.controllaSalute()
+        }
+    }
+
+    private func controllaSalute() {
+        guard inTrasmissione, inviaAttivo else { return }
+        let secondiDaUltimoInvio = ultimoInvioRiuscito.map { Date().timeIntervalSince($0) } ?? 999
+        guard secondiDaUltimoInvio > 45 else { return }
+
+        DispatchQueue.main.async {
+            self.erroreStreaming = "Invio bloccato da \(Int(secondiDaUltimoInvio))s, ricostruzione automatica in corso\u{2026}"
+        }
+        ricostruisciMotoreAudio()
+        chiudiWebSocket()
+        apriWebSocketSeServe()
     }
 
     func avvia(server: String, password: String) {
@@ -105,6 +183,7 @@ class Trasmettitore: NSObject, ObservableObject {
                     self.avviaMotoreAudio()
                     self.controllaAudioRichiesto()
                     self.avviaInvioStatoDispositivo()
+                    self.avviaSorveglianza()
                 } else {
                     self.messaggio = "Permesso al microfono negato. Vai in Impostazioni > Vanessa e concedilo."
                 }
@@ -118,6 +197,8 @@ class Trasmettitore: NSObject, ObservableObject {
         pollTimer?.invalidate(); pollTimer = nil
         riconnettiTimer?.invalidate(); riconnettiTimer = nil
         timerStatoDispositivo?.invalidate(); timerStatoDispositivo = nil
+        timerSorveglianza?.invalidate(); timerSorveglianza = nil
+        ultimoInvioRiuscito = nil
         erroreStreaming = ""
         fermaMotoreAudio()
         chiudiWebSocket()
@@ -236,6 +317,8 @@ class Trasmettitore: NSObject, ObservableObject {
             if errore != nil {
                 self?.wsTask = nil
                 self?.pianificaRiconnessione()
+            } else {
+                self?.ultimoInvioRiuscito = Date()
             }
         }
     }
@@ -285,6 +368,7 @@ class Trasmettitore: NSObject, ObservableObject {
                 self.inviaAttivo = acceso
                 self.messaggio = acceso ? "In trasmissione (anche a schermo bloccato)" : "Pronta - in attesa di un comando"
                 if acceso && !primaEraAttivo {
+                    self.ultimoInvioRiuscito = Date()
                     self.apriWebSocketSeServe()
                 } else if !acceso && primaEraAttivo {
                     self.chiudiWebSocket()
