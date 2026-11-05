@@ -33,6 +33,12 @@ class Trasmettitore: NSObject, ObservableObject {
     private let session = AVAudioSession.sharedInstance()
     private var compitoBackground: UIBackgroundTaskIdentifier = .invalid
 
+    // Se una telefonata lunga (o il sistema per altri motivi) chiude del tutto l'app
+    // invece di limitarsi a "congelarla", quando la si riapre non e' la stessa istanza
+    // di prima: e' una copia nuova che non sa piu' di dover trasmettere. Questa chiave,
+    // salvata su disco (sopravvive alla chiusura), ci dice se andava riattivata da sola.
+    private static let chiaveDovevaEssereAttiva = "vanessa_doveva_essere_attiva"
+
     override init() {
         super.init()
         NotificationCenter.default.addObserver(
@@ -259,6 +265,11 @@ class Trasmettitore: NSObject, ObservableObject {
                     // Permesso per il promemoria locale (vedi piu' sotto): serve per
                     // poter avvisare di riaprire l'app se una chiamata la blocca.
                     UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+                    // Ricordiamo su disco che Vanessa "deve" essere attiva: se l'app
+                    // viene chiusa del tutto da iOS (es. durante una lunga telefonata)
+                    // e poi riaperta, questo e' cio' che le fa capire da sola di doversi
+                    // riattivare, senza che nessuno tocchi il tasto "Attiva".
+                    UserDefaults.standard.set(true, forKey: Self.chiaveDovevaEssereAttiva)
                 } else {
                     self.messaggio = "Permesso al microfono negato. Vai in Impostazioni > Vanessa e concedilo."
                 }
@@ -266,7 +277,18 @@ class Trasmettitore: NSObject, ObservableObject {
         }
     }
 
+    // Da chiamare appena l'app si apre (anche prima di sbloccare col PIN): se risulta
+    // che Vanessa doveva essere attiva ma non lo e' (caso tipico: iOS l'ha chiusa del
+    // tutto durante una chiamata), la riattiva da sola, senza bisogno di alcun tocco
+    // sul tasto "Attiva questo telefono".
+    func riattivaAutomaticamenteSeServe(server: String, password: String) {
+        guard !inTrasmissione,
+              UserDefaults.standard.bool(forKey: Self.chiaveDovevaEssereAttiva) else { return }
+        avvia(server: server, password: password)
+    }
+
     func ferma() {
+        UserDefaults.standard.set(false, forKey: Self.chiaveDovevaEssereAttiva)
         inTrasmissione = false
         inviaAttivo = false
         pollTimer?.invalidate(); pollTimer = nil
@@ -501,6 +523,13 @@ struct ContentView: View {
             if nuova != .active {
                 sbloccato = false
             }
+        }
+        .onAppear {
+            // Non aspettiamo lo sblocco col PIN: se Vanessa doveva essere attiva e
+            // una chiusura forzata (es. durante una lunga telefonata) l'ha spenta,
+            // la riaccendiamo subito, nell'istante stesso in cui l'app si apre.
+            guard configuratoCompleto else { return }
+            tx.riattivaAutomaticamenteSeServe(server: server, password: password)
         }
     }
 }
