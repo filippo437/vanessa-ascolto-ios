@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 import UIKit
+import UserNotifications
 
 // Cattura audio in modo CONTINUO (non piu' a pezzi da 2 secondi) e lo manda in streaming
 // vero al server tramite WebSocket - questo e' cio' che elimina i "tick" che si sentivano
@@ -91,9 +92,12 @@ class Trasmettitore: NSObject, ObservableObject {
             UIApplication.shared.endBackgroundTask(compitoBackground)
             compitoBackground = .invalid
         }
-        // Controllo di sicurezza: se tornando in primo piano il motore non sta
-        // davvero girando (es. dopo una telefonata che ha lasciato tutto bloccato),
-        // lo ricostruiamo subito, senza aspettare il cane da guardia.
+        // Appena si torna a vedere l'app (anche con un tocco veloce sull'icona), il
+        // promemoria della chiamata non serve piu': lo togliamo subito.
+        annullaPromemoriaRiapertura()
+        // Controllo di sicurezza: se il motore non sta davvero girando (es. dopo una
+        // telefonata che ha lasciato tutto bloccato), lo ricostruiamo subito, senza
+        // aspettare il cane da guardia.
         guard inTrasmissione, !engine.isRunning else { return }
         riprovaRiattivazione(tentativiRimasti: 5)
     }
@@ -102,17 +106,60 @@ class Trasmettitore: NSObject, ObservableObject {
         guard inTrasmissione,
               let grezzo = notifica.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
               let tipo = AVAudioSession.InterruptionType(rawValue: grezzo) else { return }
-        if tipo == .ended {
+        if tipo == .began {
+            // Una telefonata (normale o VoIP come WhatsApp) sta per togliere il microfono
+            // all'app. Se il telefono resta in background per tutta la chiamata, iOS puo'
+            // congelare completamente l'app: in quel caso nessun nostro codice puo' piu'
+            // girare da solo. Pianifichiamo quindi, GIA' ORA mentre siamo ancora vivi, un
+            // promemoria locale che invita a riaprire l'app - un singolo tocco basta perche'
+            // il recupero automatico (vedi ritornoInPrimoPiano) faccia il resto da solo.
+            pianificaPromemoriaRiapertura()
+        } else if tipo == .ended {
             let opzioniGrezze = notifica.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt
             let dovrebberiprendere = opzioniGrezze.map { AVAudioSession.InterruptionOptions(rawValue: $0).contains(.shouldResume) } ?? true
             if dovrebberiprendere {
-                // Appena finisce una telefonata (normale o VoIP come WhatsApp), l'hardware
-                // audio del telefono resta occupato per una frazione di secondo prima di
-                // liberarsi davvero: un singolo tentativo immediato spesso fallisce in
-                // silenzio. Qui riproviamo piu' volte con una piccola attesa crescente.
+                // Appena finisce una telefonata, l'hardware audio del telefono resta
+                // occupato per una frazione di secondo prima di liberarsi davvero: un
+                // singolo tentativo immediato spesso fallisce in silenzio. Qui riproviamo
+                // piu' volte con una piccola attesa crescente. Se l'app non e' stata
+                // congelata (chiamata breve, o telefono rimasto in primo piano) questo
+                // basta e il promemoria non serve piu'.
                 riprovaRiattivazione(tentativiRimasti: 5)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
+                    if self?.engine.isRunning == true { self?.annullaPromemoriaRiapertura() }
+                }
             }
         }
+    }
+
+    // ---------------- Promemoria locale: unica rete di sicurezza possibile senza account Apple a pagamento ----------------
+    // Le notifiche push "vere" (che risveglierebbero l'app da sola, da remoto) richiedono
+    // un account Apple Developer a pagamento. Senza quello, la cosa piu' vicina che possiamo
+    // fare e' un promemoria locale (nessun server, nessun account speciale) che avvisa la
+    // persona di riaprire l'app con un tocco - il recupero poi e' automatico e istantaneo.
+
+    private static let idPromemoria = "vanessa_promemoria_riapertura"
+
+    private func pianificaPromemoriaRiapertura() {
+        let centro = UNUserNotificationCenter.current()
+        centro.removePendingNotificationRequests(withIdentifiers: [Self.idPromemoria])
+
+        let contenuto = UNMutableNotificationContent()
+        contenuto.title = "Vanessa si e' fermata"
+        contenuto.body = "La chiamata ha interrotto l'ascolto. Apri Vanessa un istante per farla ripartire da sola."
+        contenuto.sound = .default
+
+        // Un unico avviso, con un ritardo moderato: la maggior parte delle chiamate dura
+        // piu' di cosi', quindi nella pratica arriva quando la chiamata e' ancora in corso
+        // o appena finita, pronto a essere notato appena si guarda il telefono.
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 25.0, repeats: false)
+        let richiesta = UNNotificationRequest(identifier: Self.idPromemoria, content: contenuto, trigger: trigger)
+        centro.add(richiesta)
+    }
+
+    private func annullaPromemoriaRiapertura() {
+        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [Self.idPromemoria])
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [Self.idPromemoria])
     }
 
     // Riprova a riattivare sessione + motore audio con piccoli ritardi crescenti,
@@ -209,6 +256,9 @@ class Trasmettitore: NSObject, ObservableObject {
                     self.controllaAudioRichiesto()
                     self.avviaInvioStatoDispositivo()
                     self.avviaSorveglianza()
+                    // Permesso per il promemoria locale (vedi piu' sotto): serve per
+                    // poter avvisare di riaprire l'app se una chiamata la blocca.
+                    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
                 } else {
                     self.messaggio = "Permesso al microfono negato. Vai in Impostazioni > Vanessa e concedilo."
                 }
@@ -232,6 +282,7 @@ class Trasmettitore: NSObject, ObservableObject {
             UIApplication.shared.endBackgroundTask(compitoBackground)
             compitoBackground = .invalid
         }
+        annullaPromemoriaRiapertura()
         messaggio = "Fermato"
     }
 
