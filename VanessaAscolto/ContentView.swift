@@ -2,6 +2,7 @@ import SwiftUI
 import AVFoundation
 import UIKit
 import UserNotifications
+import BackgroundTasks
 
 // Cattura audio in modo CONTINUO (non piu' a pezzi da 2 secondi) e lo manda in streaming
 // vero al server tramite WebSocket - questo e' cio' che elimina i "tick" che si sentivano
@@ -114,25 +115,27 @@ class Trasmettitore: NSObject, ObservableObject {
               let tipo = AVAudioSession.InterruptionType(rawValue: grezzo) else { return }
         if tipo == .began {
             // Una telefonata (normale o VoIP come WhatsApp) sta per togliere il microfono
-            // all'app. Se il telefono resta in background per tutta la chiamata, iOS puo'
-            // congelare completamente l'app: in quel caso nessun nostro codice puo' piu'
-            // girare da solo. Pianifichiamo quindi, GIA' ORA mentre siamo ancora vivi, un
-            // promemoria locale che invita a riaprire l'app - un singolo tocco basta perche'
-            // il recupero automatico (vedi ritornoInPrimoPiano) faccia il resto da solo.
-            pianificaPromemoriaRiapertura()
+            // all'app. Se la chiamata dura tanto e il telefono resta in background, iOS
+            // potrebbe chiudere del tutto l'app: in quel caso il ramo ".ended" qui sotto
+            // non girerebbe mai (il processo sarebbe morto). Questo promemoria "di riserva"
+            // serve solo per quel caso estremo, quindi ha un ritardo lungo apposta - nella
+            // grande maggioranza dei casi verra' cancellato subito dal recupero riuscito.
+            pianificaPromemoriaRiserva()
         } else if tipo == .ended {
             let opzioniGrezze = notifica.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt
             let dovrebberiprendere = opzioniGrezze.map { AVAudioSession.InterruptionOptions(rawValue: $0).contains(.shouldResume) } ?? true
             if dovrebberiprendere {
-                // Appena finisce una telefonata, l'hardware audio del telefono resta
-                // occupato per una frazione di secondo prima di liberarsi davvero: un
-                // singolo tentativo immediato spesso fallisce in silenzio. Qui riproviamo
-                // piu' volte con una piccola attesa crescente. Se l'app non e' stata
-                // congelata (chiamata breve, o telefono rimasto in primo piano) questo
-                // basta e il promemoria non serve piu'.
+                // La chiamata e' finita davvero ORA e il nostro codice e' vivo (altrimenti
+                // questo ramo non girerebbe). Il promemoria "di riserva" non serve piu':
+                // lo togliamo e proviamo subito il recupero vero, rapido.
+                annullaPromemoriaRiserva()
                 riprovaRiattivazione(tentativiRimasti: 5)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
-                    if self?.engine.isRunning == true { self?.annullaPromemoriaRiapertura() }
+                // Diamo al recupero una manciata di secondi (i primi tentativi sono quasi
+                // immediati) e solo SE a quel punto non e' ancora ripartito avvisiamo subito
+                // - niente piu' attesa fissa di 20-25 secondi "alla cieca".
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                    guard let self = self, self.inTrasmissione, !self.engine.isRunning else { return }
+                    self.avvisaSubitoNonRipartita()
                 }
             }
         }
@@ -146,7 +149,10 @@ class Trasmettitore: NSObject, ObservableObject {
 
     private static let idPromemoria = "vanessa_promemoria_riapertura"
 
-    private func pianificaPromemoriaRiapertura() {
+    // Promemoria "di riserva": parte con un ritardo lungo (copre anche chiamate corte
+    // seguite da congelamento) ma viene quasi sempre cancellato in pochi secondi dal
+    // recupero riuscito, prima ancora di arrivare a comparire sullo schermo.
+    private func pianificaPromemoriaRiserva() {
         let centro = UNUserNotificationCenter.current()
         centro.removePendingNotificationRequests(withIdentifiers: [Self.idPromemoria])
 
@@ -155,10 +161,27 @@ class Trasmettitore: NSObject, ObservableObject {
         contenuto.body = "La chiamata ha interrotto l'ascolto. Apri Vanessa un istante per farla ripartire da sola."
         contenuto.sound = .default
 
-        // Un unico avviso, con un ritardo moderato: la maggior parte delle chiamate dura
-        // piu' di cosi', quindi nella pratica arriva quando la chiamata e' ancora in corso
-        // o appena finita, pronto a essere notato appena si guarda il telefono.
-        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 25.0, repeats: false)
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 90.0, repeats: false)
+        let richiesta = UNNotificationRequest(identifier: Self.idPromemoria, content: contenuto, trigger: trigger)
+        centro.add(richiesta)
+    }
+
+    private func annullaPromemoriaRiserva() {
+        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [Self.idPromemoria])
+    }
+
+    // Avviso immediato (pochi secondi dopo la fine della chiamata): usato solo quando il
+    // recupero automatico non e' bastato da solo, quindi serve davvero un tocco umano.
+    private func avvisaSubitoNonRipartita() {
+        let centro = UNUserNotificationCenter.current()
+        centro.removePendingNotificationRequests(withIdentifiers: [Self.idPromemoria])
+
+        let contenuto = UNMutableNotificationContent()
+        contenuto.title = "Vanessa si e' fermata"
+        contenuto.body = "La chiamata e' finita ma l'ascolto non e' ripartito da solo. Apri Vanessa un istante."
+        contenuto.sound = .default
+
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 0.5, repeats: false)
         let richiesta = UNNotificationRequest(identifier: Self.idPromemoria, content: contenuto, trigger: trigger)
         centro.add(richiesta)
     }
@@ -837,5 +860,66 @@ struct TrasmissioneView: View {
             )
             .frame(width: 160, height: 160)
             .shadow(color: tx.inviaAttivo ? Color.vanessaFucsia.opacity(0.4) : .clear, radius: 40)
+    }
+}
+
+// ------------------------------------------------------------- rete di sicurezza: controllo periodico anche senza aprire l'app
+// Senza account Apple a pagamento non possiamo "risvegliare" Vanessa all'istante e da
+// remoto (quello richiede le notifiche push vere). Possiamo pero' chiedere a iOS di farci
+// controllare periodicamente, anche se nessuno tocca il telefono per ore: non e' immediato
+// (decide iOS quando concederci il turno), ma evita che l'app resti spenta a tempo
+// indefinito in attesa che qualcuno se ne accorga e la riapra a mano.
+class VanessaAppDelegate: NSObject, UIApplicationDelegate {
+    static let idCompitoVerifica = "com.filippo.vanessaascolto.verifica"
+
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+        BGTaskScheduler.shared.register(forTaskWithIdentifier: Self.idCompitoVerifica, using: nil) { compito in
+            self.eseguiVerifica(compito as! BGAppRefreshTask)
+        }
+        return true
+    }
+
+    // Da richiamare ogni volta che l'app va in background, per prenotare il prossimo
+    // controllo: iOS lo accettera' non prima del tempo indicato, poi decide lui quando
+    // davvero concederlo in base a come viene usato il telefono.
+    func pianificaProssimaVerifica() {
+        let richiesta = BGAppRefreshTaskRequest(identifier: Self.idCompitoVerifica)
+        richiesta.earliestBeginDate = Date(timeIntervalSinceNow: 10 * 60)
+        try? BGTaskScheduler.shared.submit(richiesta)
+    }
+
+    private func eseguiVerifica(_ compito: BGAppRefreshTask) {
+        // Prenotiamo subito il turno successivo, altrimenti dopo questo non ne avremmo piu'.
+        pianificaProssimaVerifica()
+
+        let predefiniti = UserDefaults.standard
+        guard predefiniti.bool(forKey: "vanessa_doveva_essere_attiva"),
+              let server = predefiniti.string(forKey: "vanessa_server"),
+              let password = predefiniti.string(forKey: "vanessa_password"),
+              !server.isEmpty, !password.isEmpty else {
+            compito.setTaskCompleted(success: true)
+            return
+        }
+
+        let tx = Trasmettitore()
+        var finito = false
+        let segnaFinito: (Bool) -> Void = { successo in
+            guard !finito else { return }
+            finito = true
+            compito.setTaskCompleted(success: successo)
+        }
+        compito.expirationHandler = { segnaFinito(false) }
+
+        tx.riattivaAutomaticamenteSeServe(server: server, password: password)
+        // Diamo qualche secondo al microfono e alla connessione per agganciarsi
+        // davvero, prima di dichiarare concluso il controllo periodico. Una volta
+        // che il motore audio e' partito, l'app resta viva da sola grazie alla
+        // modalita' "audio" in background, indipendentemente da questo compito.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
+            segnaFinito(true)
+        }
     }
 }
