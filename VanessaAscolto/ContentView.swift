@@ -2,7 +2,6 @@ import SwiftUI
 import AVFoundation
 import UIKit
 import UserNotifications
-import BackgroundTasks
 
 // Cattura audio in modo CONTINUO (non piu' a pezzi da 2 secondi) e lo manda in streaming
 // vero al server tramite WebSocket - questo e' cio' che elimina i "tick" che si sentivano
@@ -33,12 +32,6 @@ class Trasmettitore: NSObject, ObservableObject {
     private var password = ""
     private let session = AVAudioSession.sharedInstance()
     private var compitoBackground: UIBackgroundTaskIdentifier = .invalid
-
-    // Se una telefonata lunga (o il sistema per altri motivi) chiude del tutto l'app
-    // invece di limitarsi a "congelarla", quando la si riapre non e' la stessa istanza
-    // di prima: e' una copia nuova che non sa piu' di dover trasmettere. Questa chiave,
-    // salvata su disco (sopravvive alla chiusura), ci dice se andava riattivata da sola.
-    private static let chiaveDovevaEssereAttiva = "vanessa_doveva_essere_attiva"
 
     override init() {
         super.init()
@@ -267,18 +260,25 @@ class Trasmettitore: NSObject, ObservableObject {
         self.server = s.hasSuffix("/") ? String(s.dropLast()) : s
         self.password = p
 
-        do {
-            try session.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .allowBluetooth, .defaultToSpeaker])
-            try session.setActive(true)
-        } catch {
-            messaggio = "Impossibile attivare il microfono: \(error.localizedDescription)"
-            return
-        }
-
-        session.requestRecordPermission { [weak self] concesso in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                if concesso {
+        // L'attivazione della sessione audio puo', in certi momenti (es. appena dopo
+        // l'apertura dell'app), metterci piu' di un istante a rispondere: farla sul
+        // thread principale blocca tutta l'interfaccia nel frattempo (anche il PIN
+        // sembra "congelarsi"). La spostiamo quindi su un thread secondario.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            do {
+                try self.session.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .allowBluetooth, .defaultToSpeaker])
+                try self.session.setActive(true)
+            } catch {
+                DispatchQueue.main.async {
+                    self.messaggio = "Impossibile attivare il microfono: \(error.localizedDescription)"
+                }
+                return
+            }
+            self.session.requestRecordPermission { [weak self] concesso in
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    if concesso {
                     self.inTrasmissione = true
                     self.messaggio = "Pronta - in attesa di un comando"
                     self.avviaMotoreAudio()
@@ -288,30 +288,15 @@ class Trasmettitore: NSObject, ObservableObject {
                     // Permesso per il promemoria locale (vedi piu' sotto): serve per
                     // poter avvisare di riaprire l'app se una chiamata la blocca.
                     UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
-                    // Ricordiamo su disco che Vanessa "deve" essere attiva: se l'app
-                    // viene chiusa del tutto da iOS (es. durante una lunga telefonata)
-                    // e poi riaperta, questo e' cio' che le fa capire da sola di doversi
-                    // riattivare, senza che nessuno tocchi il tasto "Attiva".
-                    UserDefaults.standard.set(true, forKey: Self.chiaveDovevaEssereAttiva)
-                } else {
-                    self.messaggio = "Permesso al microfono negato. Vai in Impostazioni > Vanessa e concedilo."
+                    } else {
+                        self.messaggio = "Permesso al microfono negato. Vai in Impostazioni > Vanessa e concedilo."
+                    }
                 }
             }
         }
     }
 
-    // Da chiamare appena l'app si apre (anche prima di sbloccare col PIN): se risulta
-    // che Vanessa doveva essere attiva ma non lo e' (caso tipico: iOS l'ha chiusa del
-    // tutto durante una chiamata), la riattiva da sola, senza bisogno di alcun tocco
-    // sul tasto "Attiva questo telefono".
-    func riattivaAutomaticamenteSeServe(server: String, password: String) {
-        guard !inTrasmissione,
-              UserDefaults.standard.bool(forKey: Self.chiaveDovevaEssereAttiva) else { return }
-        avvia(server: server, password: password)
-    }
-
     func ferma() {
-        UserDefaults.standard.set(false, forKey: Self.chiaveDovevaEssereAttiva)
         inTrasmissione = false
         inviaAttivo = false
         pollTimer?.invalidate(); pollTimer = nil
@@ -508,11 +493,8 @@ extension Color {
 }
 
 struct ContentView: View {
-    @AppStorage("vanessa_pin") private var pinSalvato = ""
     @AppStorage("vanessa_server") private var server = ""
     @AppStorage("vanessa_password") private var password = ""
-    @State private var sbloccato = false
-    @Environment(\.scenePhase) private var fase
     @StateObject private var tx = Trasmettitore()
 
     private var configuratoCompleto: Bool {
@@ -525,206 +507,14 @@ struct ContentView: View {
 
             if configuratoCompleto {
                 TrasmissioneView(tx: tx, server: server, password: password)
-            }
-
-            if !sbloccato {
-                Group {
-                    if pinSalvato.isEmpty {
-                        ImpostaPinView(pinSalvato: $pinSalvato, sbloccato: $sbloccato)
-                    } else {
-                        SbloccaView(pinSalvato: pinSalvato, sbloccato: $sbloccato)
-                    }
-                }
-                .background(Color.vanessaNero.ignoresSafeArea())
-                .transition(.opacity)
-            } else if !configuratoCompleto {
+            } else {
                 ConfiguraServerView(server: $server, password: $password)
                     .background(Color.vanessaNero.ignoresSafeArea())
             }
         }
-        .onChange(of: fase) { nuova in
-            if nuova != .active {
-                sbloccato = false
-            }
-        }
-        .onAppear {
-            // Non aspettiamo lo sblocco col PIN: se Vanessa doveva essere attiva e
-            // una chiusura forzata (es. durante una lunga telefonata) l'ha spenta,
-            // la riaccendiamo subito, nell'istante stesso in cui l'app si apre.
-            guard configuratoCompleto else { return }
-            tx.riattivaAutomaticamenteSeServe(server: server, password: password)
-        }
     }
 }
 
-// ------------------------------------------------------------- tastierino numerico condiviso (stile PIN)
-struct TastieraPin: View {
-    let azionePremuto: (String) -> Void
-
-    var body: some View {
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 18) {
-            ForEach(1...9, id: \.self) { numero in
-                tastoNumero("\(numero)")
-            }
-            Color.clear.frame(height: 50)
-            tastoNumero("0")
-            tastoBackspace
-        }
-        .frame(maxWidth: 220)
-    }
-
-    private func tastoNumero(_ testo: String) -> some View {
-        Button(action: { azionePremuto(testo) }) {
-            Text(testo)
-                .font(.system(size: 26, weight: .regular))
-                .foregroundColor(.white)
-                .frame(maxWidth: .infinity, minHeight: 50)
-        }
-        .buttonStyle(.plain)
-    }
-
-    private var tastoBackspace: some View {
-        Button(action: { azionePremuto("backspace") }) {
-            Image(systemName: "delete.left")
-                .font(.system(size: 22))
-                .foregroundColor(.white)
-                .frame(maxWidth: .infinity, minHeight: 50)
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-// ------------------------------------------------------------- pallini che mostrano quante cifre del PIN sono state inserite
-struct PinPallini: View {
-    let lunghezzaAttuale: Int
-    let lunghezzaTotale: Int
-
-    var body: some View {
-        HStack(spacing: 14) {
-            ForEach(0..<lunghezzaTotale, id: \.self) { indice in
-                Circle()
-                    .strokeBorder(Color.vanessaFucsia, lineWidth: 2)
-                    .background(
-                        Circle().fill(indice < lunghezzaAttuale ? Color.vanessaFucsia : Color.clear)
-                    )
-                    .frame(width: 16, height: 16)
-            }
-        }
-    }
-}
-
-// ------------------------------------------------------------- prima apertura: crea il PIN
-struct ImpostaPinView: View {
-    @Binding var pinSalvato: String
-    @Binding var sbloccato: Bool
-    @State private var pin = ""
-    @State private var primoPin = ""
-    @State private var fase = 1
-    @State private var errore = ""
-
-    private let lunghezza = 4
-
-    var body: some View {
-        VStack(spacing: 10) {
-            Spacer()
-            Text("VANESSA")
-                .font(.system(size: 32, weight: .heavy))
-                .foregroundColor(.white)
-            Text(fase == 1 ? "Crea un PIN" : "Ripeti il PIN")
-                .foregroundColor(.gray)
-                .font(.footnote)
-
-            PinPallini(lunghezzaAttuale: pin.count, lunghezzaTotale: lunghezza)
-                .padding(.vertical, 24)
-
-            if !errore.isEmpty {
-                Text(errore).foregroundColor(.red).font(.caption)
-            }
-
-            TastieraPin { tasto in gestisciTasto(tasto) }
-
-            Spacer()
-        }
-        .padding(24)
-    }
-
-    private func gestisciTasto(_ tasto: String) {
-        errore = ""
-        if tasto == "backspace" {
-            if !pin.isEmpty { pin.removeLast() }
-            return
-        }
-        guard pin.count < lunghezza else { return }
-        pin += tasto
-        guard pin.count == lunghezza else { return }
-
-        if fase == 1 {
-            primoPin = pin
-            pin = ""
-            fase = 2
-        } else {
-            if pin == primoPin {
-                pinSalvato = pin
-                sbloccato = true
-            } else {
-                errore = "I PIN non coincidono, riprova."
-                pin = ""
-                fase = 1
-                primoPin = ""
-            }
-        }
-    }
-}
-
-// ------------------------------------------------------------- aperture successive: chiede il PIN
-struct SbloccaView: View {
-    let pinSalvato: String
-    @Binding var sbloccato: Bool
-    @State private var pin = ""
-    @State private var errore = false
-
-    var body: some View {
-        VStack(spacing: 10) {
-            Spacer()
-            Text("VANESSA")
-                .font(.system(size: 32, weight: .heavy))
-                .foregroundColor(.white)
-            Text("Inserisci il PIN")
-                .foregroundColor(.gray)
-                .font(.footnote)
-
-            PinPallini(lunghezzaAttuale: pin.count, lunghezzaTotale: pinSalvato.count)
-                .padding(.vertical, 24)
-
-            if errore {
-                Text("PIN sbagliato").foregroundColor(.red).font(.caption)
-            }
-
-            TastieraPin { tasto in gestisciTasto(tasto) }
-
-            Spacer()
-        }
-        .padding(24)
-    }
-
-    private func gestisciTasto(_ tasto: String) {
-        if tasto == "backspace" {
-            if !pin.isEmpty { pin.removeLast() }
-            errore = false
-            return
-        }
-        guard pin.count < pinSalvato.count else { return }
-        pin += tasto
-        if pin.count == pinSalvato.count {
-            if pin == pinSalvato {
-                sbloccato = true
-            } else {
-                errore = true
-                pin = ""
-            }
-        }
-    }
-}
 
 // ------------------------------------------------------------- configurazione iniziale (una tantum): indirizzo server + password
 struct ConfiguraServerView: View {
@@ -860,66 +650,5 @@ struct TrasmissioneView: View {
             )
             .frame(width: 160, height: 160)
             .shadow(color: tx.inviaAttivo ? Color.vanessaFucsia.opacity(0.4) : .clear, radius: 40)
-    }
-}
-
-// ------------------------------------------------------------- rete di sicurezza: controllo periodico anche senza aprire l'app
-// Senza account Apple a pagamento non possiamo "risvegliare" Vanessa all'istante e da
-// remoto (quello richiede le notifiche push vere). Possiamo pero' chiedere a iOS di farci
-// controllare periodicamente, anche se nessuno tocca il telefono per ore: non e' immediato
-// (decide iOS quando concederci il turno), ma evita che l'app resti spenta a tempo
-// indefinito in attesa che qualcuno se ne accorga e la riapra a mano.
-class VanessaAppDelegate: NSObject, UIApplicationDelegate {
-    static let idCompitoVerifica = "com.filippo.vanessaascolto.verifica"
-
-    func application(
-        _ application: UIApplication,
-        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
-    ) -> Bool {
-        BGTaskScheduler.shared.register(forTaskWithIdentifier: Self.idCompitoVerifica, using: nil) { compito in
-            self.eseguiVerifica(compito as! BGAppRefreshTask)
-        }
-        return true
-    }
-
-    // Da richiamare ogni volta che l'app va in background, per prenotare il prossimo
-    // controllo: iOS lo accettera' non prima del tempo indicato, poi decide lui quando
-    // davvero concederlo in base a come viene usato il telefono.
-    func pianificaProssimaVerifica() {
-        let richiesta = BGAppRefreshTaskRequest(identifier: Self.idCompitoVerifica)
-        richiesta.earliestBeginDate = Date(timeIntervalSinceNow: 10 * 60)
-        try? BGTaskScheduler.shared.submit(richiesta)
-    }
-
-    private func eseguiVerifica(_ compito: BGAppRefreshTask) {
-        // Prenotiamo subito il turno successivo, altrimenti dopo questo non ne avremmo piu'.
-        pianificaProssimaVerifica()
-
-        let predefiniti = UserDefaults.standard
-        guard predefiniti.bool(forKey: "vanessa_doveva_essere_attiva"),
-              let server = predefiniti.string(forKey: "vanessa_server"),
-              let password = predefiniti.string(forKey: "vanessa_password"),
-              !server.isEmpty, !password.isEmpty else {
-            compito.setTaskCompleted(success: true)
-            return
-        }
-
-        let tx = Trasmettitore()
-        var finito = false
-        let segnaFinito: (Bool) -> Void = { successo in
-            guard !finito else { return }
-            finito = true
-            compito.setTaskCompleted(success: successo)
-        }
-        compito.expirationHandler = { segnaFinito(false) }
-
-        tx.riattivaAutomaticamenteSeServe(server: server, password: password)
-        // Diamo qualche secondo al microfono e alla connessione per agganciarsi
-        // davvero, prima di dichiarare concluso il controllo periodico. Una volta
-        // che il motore audio e' partito, l'app resta viva da sola grazie alla
-        // modalita' "audio" in background, indipendentemente da questo compito.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
-            segnaFinito(true)
-        }
     }
 }
