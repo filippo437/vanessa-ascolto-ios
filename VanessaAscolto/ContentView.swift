@@ -119,7 +119,8 @@ class Trasmettitore: NSObject, ObservableObject {
             // potrebbe chiudere del tutto l'app: in quel caso il ramo ".ended" qui sotto
             // non girerebbe mai (il processo sarebbe morto). Questo promemoria "di riserva"
             // serve solo per quel caso estremo, quindi ha un ritardo lungo apposta - nella
-            // grande maggioranza dei casi verra' cancellato subito dal recupero riuscito.
+            // grande maggioranza dei casi verra' cancellato subito dal recupero riuscito,
+            // senza mai comparire sullo schermo.
             pianificaPromemoriaRiserva()
         } else if tipo == .ended {
             let opzioniGrezze = notifica.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt
@@ -131,8 +132,7 @@ class Trasmettitore: NSObject, ObservableObject {
                 annullaPromemoriaRiserva()
                 riprovaRiattivazione(tentativiRimasti: 5)
                 // Diamo al recupero una manciata di secondi (i primi tentativi sono quasi
-                // immediati) e solo SE a quel punto non e' ancora ripartito avvisiamo subito
-                // - niente piu' attesa fissa di 20-25 secondi "alla cieca".
+                // immediati) e solo SE a quel punto non e' ancora ripartito avvisiamo subito.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
                     guard let self = self, self.inTrasmissione, !self.engine.isRunning else { return }
                     self.avvisaSubitoNonRipartita()
@@ -149,9 +149,9 @@ class Trasmettitore: NSObject, ObservableObject {
 
     private static let idPromemoria = "vanessa_promemoria_riapertura"
 
-    // Promemoria "di riserva": parte con un ritardo lungo (copre anche chiamate corte
-    // seguite da congelamento) ma viene quasi sempre cancellato in pochi secondi dal
-    // recupero riuscito, prima ancora di arrivare a comparire sullo schermo.
+    // Promemoria "di riserva": parte con un ritardo lungo (copre anche il caso in cui
+    // l'app venga chiusa del tutto durante la chiamata) ma viene quasi sempre cancellato
+    // in pochi secondi dal recupero riuscito, prima ancora di arrivare a comparire.
     private func pianificaPromemoriaRiserva() {
         let centro = UNUserNotificationCenter.current()
         centro.removePendingNotificationRequests(withIdentifiers: [Self.idPromemoria])
